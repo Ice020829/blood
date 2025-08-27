@@ -1,310 +1,437 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-# 导入优化的数据处理类
-from cached_data_preprocess import GlucoseDatasetSliceOptimized
-from model import VGG16Regressor1D
 import numpy as np
-from sklearn.metrics import mean_squared_error, r2_score
+from torch.utils.data import DataLoader, random_split
+from data_preprocess import GlucoseDataset
+from model import PytorchWaveletSVM, WaveletSVMPredictor
+import joblib
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, r2_score
 import os
-import time
+import pickle
 
 
 def calculate_mard(true, pred):
-    """计算MARD (Mean Absolute Relative Difference)"""
-    true = np.asarray(true).squeeze()
-    pred = np.asarray(pred).squeeze()
-    mask = true > 0
+    true = np.asarray(true)
+    pred = np.asarray(pred)
+    true = np.squeeze(true)
+    pred = np.squeeze(pred)
+    mask = true > 0  # 避免除零
     return np.mean(np.abs(true[mask] - pred[mask]) / true[mask]) * 100
 
 
-class MARDEarlyStopping:
-    """基于MARD的早停机制"""
-    def __init__(self, patience=10, min_delta=0.1, path='best_model.pth'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.path = path
-        self.mard_history = []
-        self.best_mard = float('inf')
-        self.early_stop = False
-        
-    def __call__(self, current_mard, model):
-        self.mard_history.append(current_mard)
-        
-        if current_mard < self.best_mard:
-            self.best_mard = current_mard
-            self.save_checkpoint(model)
-            
-        if len(self.mard_history) >= self.patience:
-            start_mard = self.mard_history[-self.patience]
-            end_mard = self.mard_history[-1]
-            improvement = start_mard - end_mard
-            
-            if improvement < self.min_delta:
-                print(f"MARD improvement over last {self.patience} epochs ({improvement:.4f}) is less than threshold ({self.min_delta})")
-                self.early_stop = True
-            
-    def save_checkpoint(self, model):
-        """保存模型"""
-        # 确保目录存在
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        
-        # 如果模型是DataParallel包装的，我们需要保存其module
-        if isinstance(model, nn.DataParallel):
-            torch.save(model.module.state_dict(), self.path)
-        else:
-            torch.save(model.state_dict(), self.path)
-            
-        print(f"Saved model with best MARD: {self.best_mard:.4f}%")
-
-
-def train_vgg16regressor1d():
-    """训练并验证VGG16Regressor1D模型（使用DataParallel多GPU和优化的数据加载）"""
-    start_time = time.time()
+def train_svm_model():
+    # 配置
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 64  # SVM可以处理更大的批次
     
-    # 配置数据路径
-    data_dir = '/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明'
-    xlsx_paths = [
-        "/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明/无创血糖测试记录表(1).xlsx",
-        "/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明/无创血糖测试记录表(1).xlsx"
-    ]
+    # 设置保存路径
+    save_dir = "/home/pivot/zhenghongjie/wavelet_svm"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # 设置缓存目录
-    cache_dir = '/home/pivot/zhenghongjie/裁剪信号_vgg/dataset_cache'
+    xlsx_paths = ["/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明/无创血糖测试记录表(1).xlsx",
+                  "/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明/无创血糖测试记录表(1).xlsx"]
     
-    print("Creating optimized dataset with caching...")
-    # 创建优化的数据集
-    dataset = GlucoseDatasetSliceOptimized(
-        data_dir=data_dir,
-        xlsx_paths=xlsx_paths,
-        window_size=100,
-        step_size=50,
-        sampling_rate=100,
-        train=True,
-        cache_dir=cache_dir,
-        use_cache=True,
-        num_workers=8  # 使用8个进程并行处理数据
-    )
-    
+    # 数据集
+    dataset = GlucoseDataset('/home/pivot/zhenghongjie/第二批 中山无创血糖训练样本及相关记录说明/', xlsx_paths)
     print(f"Dataset size: {len(dataset)}")
     
-    # 划分训练集、验证集和测试集
-    total_size = len(dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
+    # 添加检查：确保数据集不为空
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty! Please check your data loading process.")
     
-    train_set, val_set, test_set = random_split(
-        dataset, 
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # 划分数据集为训练集(70%)、验证集(15%)和测试集(15%)
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
     
-    print(f"Train set size: {len(train_set)}")
-    print(f"Validation set size: {len(val_set)}")
-    print(f"Test set size: {len(test_set)}")
+    # 确保每个部分至少有1个样本
+    if train_size == 0 or val_size == 0 or test_size == 0:
+        raise ValueError(f"Dataset too small to split: total={len(dataset)}, train={train_size}, val={val_size}, test={test_size}")
     
-    # 数据加载器
-    # 调整batch_size以适应多GPU
-    batch_size = 256  # 增大批次大小以更好地利用多GPU
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=8, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, num_workers=8, pin_memory=True)
+    # 使用两步划分方式，确保兼容性
+    temp_dataset, test_set = random_split(dataset, [train_size + val_size, test_size])
+    train_set, val_set = random_split(temp_dataset, [train_size, val_size])
     
-    # 初始化模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Split sizes - Train: {len(train_set)}, Validation: {len(val_set)}, Test: {len(test_set)}")
     
-    # 使用VGG16Regressor1D模型
-    model = VGG16Regressor1D(input_channels=2).to(device)
+    # 验证数据集大小
+    for name, dataset in [("Train", train_set), ("Validation", val_set), ("Test", test_set)]:
+        if len(dataset) == 0:
+            raise ValueError(f"{name} dataset is empty after splitting!")
     
-    # 如果有多个GPU，使用DataParallel
-    if torch.cuda.device_count() > 1:
-        print(f"使用 {torch.cuda.device_count()} 个GPU并行训练")
-        model = nn.DataParallel(model)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size)
+    test_loader = DataLoader(test_set, batch_size=batch_size)
     
-    # 打印模型参数量
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters: {total_params:,}")
+    # 收集所有训练数据
+    print("Collecting training data...")
+    X_train_list, y_train_list, static_train_list = [], [], []
     
-    # 损失函数和优化器
-    criterion = nn.MSELoss()
-    
-    # 对于多GPU训练，可以考虑稍微增大学习率
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', patience=5, factor=0.5, verbose=True
-    )
-    
-    # 初始化基于MARD的早停
-    model_save_path = '/home/pivot/zhenghongjie/裁剪信号_vgg/best_model_vgg_multi_gpu.pth'
-    early_stopping = MARDEarlyStopping(patience=15, min_delta=0.05, path=model_save_path)
-    
-    # 训练轮数
-    num_epochs = 50
-    
-    # 存储训练过程中的指标
-    train_losses = []
-    val_losses = []
-    val_mards = []
-    
-    print("开始训练 VGG16Regressor1D 模型 (使用DataParallel多GPU)...")
-    for epoch in range(num_epochs):
-        epoch_start = time.time()
-        
-        # 训练阶段
-        model.train()
-        epoch_loss = 0.0
-        
-        for batch_idx, (signals, labels) in enumerate(train_loader):
-            signals, labels = signals.to(device), labels.to(device)
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc="Loading training data")):
+        # 检查批次大小
+        if len(batch) == 0:
+            print(f"Warning: Empty batch {batch_idx} encountered, skipping")
+            continue
             
-            # 前向传播
-            outputs = model(signals)
-            loss = criterion(outputs, labels)
+        # 解包数据
+        if len(batch) == 4:
+            seq, label, static_input, lengths = batch
+        elif len(batch) == 3:
+            seq, label, static_input = batch
+        else:
+            seq, label = batch
+            static_input = None
+        
+        # 检查批次维度
+        if seq.shape[0] == 0:
+            print(f"Warning: Batch {batch_idx} has 0 samples, skipping")
+            continue
             
-            # 反向传播和优化
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            epoch_loss += loss.item() * signals.size(0)
-            
-            # 打印批次进度
-            if (batch_idx + 1) % 10 == 0:
-                print(f'Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}')
-        
-        train_loss = epoch_loss / len(train_set)
-        train_losses.append(train_loss)
-        
-        # 验证阶段
-        model.eval()
-        val_loss = 0.0
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for signals, labels in val_loader:
-                signals, labels = signals.to(device), labels.to(device)
-                outputs = model(signals)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item() * signals.size(0)
-                
-                all_preds.extend(outputs.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        val_loss = val_loss / len(val_set)
-        val_losses.append(val_loss)
-        
-        # 计算当前验证集的MARD
-        val_preds = np.array(all_preds)
-        val_labels = np.array(all_labels)
-        current_mard = calculate_mard(val_labels, val_preds)
-        val_mards.append(current_mard)
-        
-        # 学习率调整
-        scheduler.step(val_loss)
-        
-        # 计算当前学习率
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # 打印进度
-        epoch_time = time.time() - epoch_start
-        print(f"Epoch {epoch+1}/{num_epochs}, "
-              f"Train Loss: {train_loss:.4f}, "
-              f"Val Loss: {val_loss:.4f}, "
-              f"Val MARD: {current_mard:.4f}%, "
-              f"LR: {current_lr:.6f}, "
-              f"Time: {epoch_time:.2f}s")
-        
-        # 早停检查
-        early_stopping(current_mard, model)
-        if early_stopping.early_stop:
-            print("Early stopping triggered due to minimal MARD improvement")
-            break
+        X_train_list.append(seq.numpy())
+        y_train_list.append(label.numpy())
+        if static_input is not None:
+            static_train_list.append(static_input.numpy())
     
-    total_time = time.time() - start_time
-    print(f"Training completed in {total_time:.2f} seconds")
+    # 检查是否收集到数据
+    if not X_train_list:
+        raise ValueError("No training data was collected! Check your DataLoader and GlucoseDataset implementation.")
     
-    # 加载最佳模型进行评估
-    if torch.cuda.device_count() > 1:
-        # 创建非并行模型用于加载权重
-        best_model = VGG16Regressor1D(input_channels=2).to(device)
-        best_model.load_state_dict(torch.load(model_save_path))
+    # 合并所有批次
+    X_train = np.concatenate(X_train_list, axis=0)
+    y_train = np.concatenate(y_train_list, axis=0)
+    
+    # 将y转换为1D数组，修复警告
+    y_train = y_train.ravel()  # 将列向量转换为1D数组
+    
+    # 检查静态特征
+    if static_train_list:
+        static_train = np.concatenate(static_train_list, axis=0)
+        # 检查静态特征形状
+        if static_train.shape[0] == 0:
+            print("Warning: Static features have 0 samples, setting to None")
+            static_train = None
     else:
-        model.load_state_dict(torch.load(model_save_path))
-        best_model = model
+        static_train = None
+    
+    print(f"Training data shape: X={X_train.shape}, y={y_train.shape}")
+    if static_train is not None:
+        print(f"Static features shape: {static_train.shape}")
+    
+    # 修改WaveletSVMPredictor类以处理空数据（这是假设的修复，实际需要修改model.py文件）
+    class FixedWaveletSVMPredictor(WaveletSVMPredictor):
+        def fit(self, X, y, static_features=None):
+            # 检查输入数据是否为空
+            if X.shape[0] == 0:
+                raise ValueError("Cannot fit model with empty data (0 samples)")
+                
+            # 其余代码与原始类相同
+            return super().fit(X, y, static_features)
+    
+    # 使用修复后的预测器类
+    try:
+        # 创建和训练SVM模型
+        print("\nTraining SVM model...")
+        svm_model = FixedWaveletSVMPredictor(
+            wavelet='db4',
+            level=3,
+            kernel='rbf',
+            use_grid_search=True  # 使用网格搜索找到最佳参数
+        )
+    except NameError:
+        # 如果无法修改类，则使用原始类但添加验证
+        print("\nTraining SVM model with additional validation...")
+        if X_train.shape[0] == 0:
+            raise ValueError("Cannot train model with empty data (0 samples)")
+            
+        svm_model = WaveletSVMPredictor(
+            wavelet='db4',
+            level=3,
+            kernel='rbf',
+            use_grid_search=True
+        )
+    
+    # 训练模型前检查数据
+    if X_train.shape[0] == 0:
+        raise ValueError("Cannot train model with empty data (0 samples)")
+    
+    svm_model.fit(X_train, y_train, static_train)
+    
+    # 验证
+    print("\nEvaluating on validation set...")
+    X_val_list, y_val_list, static_val_list = [], [], []
+    
+    for batch in tqdm(val_loader, desc="Loading validation data"):
+        # 解包数据
+        if len(batch) == 4:
+            seq, label, static_input, lengths = batch
+        elif len(batch) == 3:
+            seq, label, static_input = batch
+        else:
+            seq, label = batch
+            static_input = None
         
-    best_model.eval()
+        # 检查批次维度
+        if seq.shape[0] == 0:
+            print("Warning: Validation batch has 0 samples, skipping")
+            continue
+            
+        X_val_list.append(seq.numpy())
+        y_val_list.append(label.numpy())
+        if static_input is not None:
+            static_val_list.append(static_input.numpy())
     
-    # 对验证集进行预测
-    val_preds = []
-    val_labels = []
+    # 检查是否收集到验证数据
+    if not X_val_list:
+        print("Warning: No validation data was collected!")
+        val_mard = float('nan')
+    else:
+        # 合并所有批次
+        X_val = np.concatenate(X_val_list, axis=0)
+        y_val = np.concatenate(y_val_list, axis=0)
+        
+        # 将y转换为1D数组
+        y_val = y_val.ravel()
+        
+        static_val = np.concatenate(static_val_list, axis=0) if static_val_list else None
+        
+        # 预测验证集
+        y_val_pred = svm_model.predict(X_val, static_val)
+        
+        # 计算验证集MARD
+        val_mard = calculate_mard(y_val, y_val_pred)
+        print(f'Validation MARD: {val_mard:.2f}%')
     
-    with torch.no_grad():
-        for signals, labels in val_loader:
-            signals = signals.to(device)
-            outputs = best_model(signals)
-            val_preds.extend(outputs.cpu().numpy())
-            val_labels.extend(labels.numpy())
+    # 测试
+    print("\nEvaluating on test set...")
+    X_test_list, y_test_list, static_test_list = [], [], []
     
-    val_preds = np.array(val_preds)
-    val_labels = np.array(val_labels)
+    for batch in tqdm(test_loader, desc="Loading test data"):
+        # 解包数据
+        if len(batch) == 4:
+            seq, label, static_input, lengths = batch
+        elif len(batch) == 3:
+            seq, label, static_input = batch
+        else:
+            seq, label = batch
+            static_input = None
+        
+        # 检查批次维度
+        if seq.shape[0] == 0:
+            print("Warning: Test batch has 0 samples, skipping")
+            continue
+            
+        X_test_list.append(seq.numpy())
+        y_test_list.append(label.numpy())
+        if static_input is not None:
+            static_test_list.append(static_input.numpy())
     
-    # 计算验证集评估指标
-    val_rmse = np.sqrt(mean_squared_error(val_labels, val_preds))
-    val_r2 = r2_score(val_labels, val_preds)
-    val_mard = calculate_mard(val_labels, val_preds)
+    # 检查是否收集到测试数据
+    if not X_test_list:
+        print("Warning: No test data was collected!")
+        test_mard = float('nan')
+    else:
+        # 合并所有批次
+        X_test = np.concatenate(X_test_list, axis=0)
+        y_test = np.concatenate(y_test_list, axis=0)
+        
+        # 将y转换为1D数组
+        y_test = y_test.ravel()
+        
+        static_test = np.concatenate(static_test_list, axis=0) if static_test_list else None
+        
+        # 预测测试集
+        y_test_pred = svm_model.predict(X_test, static_test)
+        
+        # 计算测试集MARD
+        test_mard = calculate_mard(y_test, y_test_pred)
+        print(f'Test MARD: {test_mard:.2f}%')
     
-    print(f"\n=== Validation Set Results ===")
-    print(f"RMSE: {val_rmse:.2f}")
-    print(f"R²: {val_r2:.4f}")
-    print(f"MARD: {val_mard:.2f}%")
+    # 保存模型 - 方法1：使用joblib
+    model_path_joblib = os.path.join(save_dir, 'best_wavelet_svm_model.joblib')
+    try:
+        svm_model.save_model(model_path_joblib)
+        print(f"Model saved to '{model_path_joblib}'")
+    except Exception as e:
+        print(f"Error saving model with joblib: {e}")
+        
+        # 备用方法：直接保存模型对象
+        try:
+            joblib.dump(svm_model, model_path_joblib)
+            print(f"Model saved directly to '{model_path_joblib}'")
+        except Exception as e2:
+            print(f"Second attempt failed: {e2}")
     
-    # 对测试集进行预测和评估
-    test_preds = []
-    test_labels = []
+    # 保存模型 - 方法2：使用pickle
+    model_path_pickle = os.path.join(save_dir, 'best_wavelet_svm_model.pkl')
+    try:
+        with open(model_path_pickle, 'wb') as f:
+            pickle.dump(svm_model, f)
+        print(f"Model saved with pickle to '{model_path_pickle}'")
+    except Exception as e:
+        print(f"Error saving model with pickle: {e}")
     
-    with torch.no_grad():
-        for signals, labels in test_loader:
-            signals = signals.to(device)
-            outputs = best_model(signals)
-            test_preds.extend(outputs.cpu().numpy())
-            test_labels.extend(labels.numpy())
+    # 保存PyTorch包装版本
+    pytorch_model_path = os.path.join(save_dir, 'wavelet_svm_pytorch_model.pth')
+    try:
+        pytorch_model = PytorchWaveletSVM(
+            input_dim=X_train.shape[2],
+            static_dim=static_train.shape[1] if static_train is not None else 0
+        )
+        pytorch_model.svm_model = svm_model
+        pytorch_model.is_fitted = True
+        
+        # 保存整个模型对象而不是state_dict
+        torch.save(pytorch_model, pytorch_model_path)
+        print(f"PyTorch model saved to '{pytorch_model_path}'")
+    except Exception as e:
+        print(f"Error saving PyTorch model: {e}")
+        
+        # 尝试只保存必要的属性
+        try:
+            model_data = {
+                'input_dim': X_train.shape[2],
+                'static_dim': static_train.shape[1] if static_train is not None else 0,
+                'svm_model': svm_model
+            }
+            torch.save(model_data, pytorch_model_path.replace('.pth', '_data.pth'))
+            print(f"Model data saved to '{pytorch_model_path.replace('.pth', '_data.pth')}'")
+        except Exception as e2:
+            print(f"Second attempt to save PyTorch model failed: {e2}")
     
-    test_preds = np.array(test_preds)
-    test_labels = np.array(test_labels)
+    # 保存训练结果
+    results_path = os.path.join(save_dir, 'training_results.pkl')
+    try:
+        results = {
+            'val_mard': val_mard,
+            'test_mard': test_mard,
+            'val_predictions': y_val_pred if 'y_val_pred' in locals() else None,
+            'val_true_values': y_val if 'y_val' in locals() else None,
+            'test_predictions': y_test_pred if 'y_test_pred' in locals() else None,
+            'test_true_values': y_test if 'y_test' in locals() else None,
+            'best_params': svm_model.model.best_params_ if hasattr(svm_model, 'use_grid_search') and svm_model.use_grid_search else None
+        }
+        with open(results_path, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"Training results saved to '{results_path}'")
+    except Exception as e:
+        print(f"Error saving results: {e}")
     
-    # 计算测试集评估指标
-    test_rmse = np.sqrt(mean_squared_error(test_labels, test_preds))
-    test_r2 = r2_score(test_labels, test_preds)
-    test_mard = calculate_mard(test_labels, test_preds)
+    # 列出保存目录中的所有文件
+    print("\nFiles in save directory:")
+    for file in os.listdir(save_dir):
+        file_path = os.path.join(save_dir, file)
+        file_size = os.path.getsize(file_path) / 1024  # 转换为KB
+        print(f"- {file}: {file_size:.1f} KB")
     
-    print(f"\n=== Test Set Results ===")
-    print(f"RMSE: {test_rmse:.2f}")
-    print(f"R²: {test_r2:.4f}")
-    print(f"MARD: {test_mard:.2f}%")
+    return val_mard, test_mard
+
+
+def load_saved_model(model_path):
+    """加载保存的模型"""
+    print(f"Attempting to load model from: {model_path}")
     
-    # 返回测试集的MARD
-    return test_mard
+    # 尝试不同的加载方法
+    if model_path.endswith('.joblib'):
+        try:
+            model = joblib.load(model_path)
+            print("Model loaded successfully with joblib")
+            return model
+        except Exception as e:
+            print(f"Error loading with joblib: {e}")
+    
+    elif model_path.endswith('.pkl'):
+        try:
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+            print("Model loaded successfully with pickle")
+            return model
+        except Exception as e:
+            print(f"Error loading with pickle: {e}")
+    
+    elif model_path.endswith('.pth'):
+        try:
+            model = torch.load(model_path)
+            print("Model loaded successfully with torch")
+            return model
+        except Exception as e:
+            print(f"Error loading with torch: {e}")
+    
+    print("Failed to load model")
+    return None
+
+
+# 另外，需要修改WaveletSVMPredictor类中的StandardScaler使用部分
+# 这部分代码应该在model.py文件中
+
+"""
+# 在model.py中找到WaveletSVMPredictor类的fit方法，添加数据验证：
+
+def fit(self, X, y, static_features=None):
+    # 确保输入数据不为空
+    if X.shape[0] == 0:
+        raise ValueError("Cannot fit model with empty data (0 samples)")
+        
+    # 提取小波特征
+    X_features = self._extract_wavelet_features(X)
+    
+    # 处理静态特征
+    if static_features is not None:
+        # 检查静态特征是否为空
+        if static_features.shape[0] == 0:
+            print("Warning: Static features have 0 samples, ignoring static features")
+        else:
+            # 合并特征
+            X_features = np.hstack((X_features, static_features))
+    
+    # 标准化特征之前检查
+    if X_features.shape[0] == 0:
+        raise ValueError("Cannot standardize empty features array")
+        
+    # 标准化特征
+    if self.standardize:
+        # 修复：仅当有样本时才使用StandardScaler
+        if X_features.shape[0] > 0:
+            self.scaler = StandardScaler()
+            X_features = self.scaler.fit_transform(X_features)
+    
+    # 网格搜索或直接训练
+    if self.use_grid_search:
+        # 仅当有足够样本时使用网格搜索
+        if X_features.shape[0] >= 5:  # 确保有足够样本进行交叉验证
+            param_grid = {'C': [0.1, 1, 10, 100], 'gamma': ['scale', 'auto', 0.1, 0.01, 0.001]}
+            grid_search = GridSearchCV(
+                SVR(kernel=self.kernel), 
+                param_grid, 
+                cv=min(5, X_features.shape[0]),  # 确保cv不超过样本数
+                scoring='neg_mean_absolute_error'
+            )
+            grid_search.fit(X_features, y)
+            self.model = grid_search
+        else:
+            print("Warning: Not enough samples for grid search, using default parameters")
+            self.model = SVR(kernel=self.kernel)
+            self.model.fit(X_features, y)
+    else:
+        self.model = SVR(kernel=self.kernel)
+        self.model.fit(X_features, y)
+    
+    self.is_fitted = True
+    return self
+"""
 
 
 if __name__ == '__main__':
-    print("=== Training VGG16Regressor1D Model for Glucose Prediction ===")
-    # 设置确定性随机种子
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-    np.random.seed(42)
+    # 使用标准SVM训练
+    val_mard, test_mard = train_svm_model()
+    print(f"\nFinal results - Validation MARD: {val_mard:.2f}%, Test MARD: {test_mard:.2f}%")
     
-    vgg_mard = train_vgg16regressor1d()
-    
-    print("\n=== Final Result ===")
-    print(f"VGG16Regressor1D MARD: {vgg_mard:.2f}%")
+    # 测试模型加载
+    save_dir = "/home/pivot/zhenghongjie/wavelet_svm"  # 修正为一致的保存路径
+    if os.path.exists(save_dir):
+        for file in os.listdir(save_dir):
+            if file.endswith(('.joblib', '.pkl', '.pth')):
+                model_path = os.path.join(save_dir, file)
+                loaded_model = load_saved_model(model_path)
+                if loaded_model:
+                    print(f"Successfully verified loading of {file}")
